@@ -1,0 +1,52 @@
+# --- Keil MDK-ARM ---
+# Build Artifacts
+*.bak
+*.dep
+*.htm
+*.lnp
+*.map
+*.lst
+*.obj
+*.o
+*.d
+*.crf
+*.elf
+*.hex
+*.bin
+*.axf
+*.sct
+!**/SWM221_link_section.sct
+!**/spiflash_data.sct
+*.build_log.htm
+*.scvd
+**/out/
+**/Listings/
+**/Objects/
+
+# User-specific settings (GUI and Options)
+*.uvgui.*
+*.uvguix.*
+*.uvopt
+*.uvoptx
+
+# --- Debugger & Tool Logs ---
+JLinkLog.txt
+JLinkSettings.ini
+keil-build-viewer.log
+keil-build-viewer-record.txt
+
+# --- VS Code ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# --- OS/System ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Temp/Backups ---
+*~
+*.swp

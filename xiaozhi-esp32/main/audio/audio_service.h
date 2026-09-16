@@ -47,9 +47,11 @@
 // drained the old 3000 ms mid-topic. The queue holds encoded Opus, so the 50 extra packets cost
 // about 13 KB at the 147-byte frames the backend sends, against ~110 KB of minimum free SRAM.
 #define MAX_DECODE_BUFFER_DURATION_MS 6000
-// Favor faster conversational replies with a smaller startup buffer. Real-time-paced TTS
-// cannot rebuild this reserve during playback, so cellular stalls may cause underruns.
-#define STREAM_PLAYBACK_PREBUFFER_DURATION_MS 0
+// Favor faster conversational replies with a smaller startup buffer. Measured 4G TTS
+// arrivals averaged 46-60 ms with a 146 ms worst case, so 200 ms still covers the jitter.
+// Real-time-paced TTS cannot rebuild this reserve during playback, so cellular stalls
+// may cause underruns.
+#define STREAM_PLAYBACK_PREBUFFER_DURATION_MS 200
 // A queued topic is pushed content, so no one is waiting on a conversational turn and the longer
 // startup delay is not perceptible. Buying jitter budget matters more there than first-word latency.
 #define TOPIC_PLAYBACK_PREBUFFER_DURATION_MS 4000

@@ -232,6 +232,18 @@ bool WebsocketProtocol::SendText(const std::string& text) {
         cJSON_AddStringToObject(payload, "event", "vad_done");
         cJSON_AddItemToObject(dto, "payload", payload);
         should_send = true;
+    } else if (type_str == "cancel_turn" || type_str == "abort") {
+        // Both revoke the active server-side turn. "abort" used to have no mapping
+        // here and was silently dropped, so barge-in never reached the backend and
+        // it kept streaming the rest of the answer; map it to cancel_turn now.
+        cJSON_AddStringToObject(dto, "type", "event");
+        cJSON* payload = cJSON_CreateObject();
+        cJSON_AddStringToObject(payload, "event", "cancel_turn");
+        cJSON* legacy_reason = cJSON_GetObjectItem(legacy, "reason");
+        const char* reason = cJSON_IsString(legacy_reason) ? legacy_reason->valuestring : "user_wakeup";
+        cJSON_AddStringToObject(payload, "reason", reason);
+        cJSON_AddItemToObject(dto, "payload", payload);
+        should_send = true;
     } else if (type_str == "mcp") {
         cJSON_AddStringToObject(dto, "type", "event");
         cJSON* payload = cJSON_CreateObject();
@@ -582,10 +594,28 @@ void WebsocketProtocol::ParseBotResponse(const cJSON* payload, bool is_binary_ev
                     // user_text response because this is the earliest point the text is
                     // available and it does not depend on user_text also arriving.
                     ESP_LOGI(TAG, "ASR heard: \"%s\"", text->valuestring);
-                    if (text->valuestring[0] == '\0') {
+                    if (Application::IsAsrTextEmpty(text->valuestring)) {
                         Application::GetInstance().RestartListeningAfterEmptyAsr();
+                    } else {
+                        // Non-empty text guarantees downstream llm_*/tts events,
+                        // so this is where the user learns an answer is coming.
+                        // Empty results stay silent, and turns revoked before
+                        // asr_done arrive outside the Connecting state, where
+                        // the prompt is suppressed.
+                        Application::GetInstance().PlayAsrSuccessPrompt();
                     }
                 }
+            } else if (event_str == "turn_cancelled") {
+                // Ack for the cancel_turn event. The server nests the fields under
+                // "data": status is "ok" or "no_active_turn"; cancelled_stage
+                // (asr/llm/tts) records how far the revoked turn had progressed,
+                // which measures how early the device revokes in practice.
+                cJSON* data = cJSON_GetObjectItem(message, "data");
+                cJSON* status = cJSON_GetObjectItem(data, "status");
+                cJSON* cancelled_stage = cJSON_GetObjectItem(data, "cancelled_stage");
+                ESP_LOGI(TAG, "PIPELINE turn_cancelled status=%s stage=%s",
+                         cJSON_IsString(status) ? status->valuestring : "?",
+                         cJSON_IsString(cancelled_stage) ? cancelled_stage->valuestring : "?");
             } else if (event_str == "llm_start") {
                 pipeline_llm_start_ms_ = server_timestamp_ms;
                 if (pipeline_asr_done_ms_ > 0 && server_timestamp_ms > 0) {
@@ -605,8 +635,12 @@ void WebsocketProtocol::ParseBotResponse(const cJSON* payload, bool is_binary_ev
                              server_timestamp_ms - pipeline_llm_done_ms_);
                 }
                 if (pipeline_asr_start_ms_ > 0 && server_timestamp_ms > 0) {
-                    ESP_LOGI(TAG, "PIPELINE ASR_TO_TTS_START total=%.0fms",
+                    ESP_LOGI(TAG, "PIPELINE ASR_START_TO_TTS_START total=%.0fms",
                              server_timestamp_ms - pipeline_asr_start_ms_);
+                }
+                if( pipeline_asr_done_ms_ > 0 && server_timestamp_ms > 0) {
+                    ESP_LOGI(TAG, "PIPELINE ASR_DONE_TO_TTS_START wait=%.0fms",
+                             server_timestamp_ms - pipeline_asr_done_ms_);
                 }
             } else if (event_str == "tts_done") {
                 if (pipeline_tts_start_ms_ > 0 && server_timestamp_ms > 0) {

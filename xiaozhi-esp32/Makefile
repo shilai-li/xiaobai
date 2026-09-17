@@ -3,7 +3,7 @@ init:
 	@echo "Initializing environment..."
 	mkdir -p ~/esp && cd ~/esp
 	@echo "Cloning esp-idf repository..."
-	git clone -b v5.5.2 --recursive https://github.com/espressif/esp-idf.git
+	git clone -b v5.5.4 --recursive https://github.com/espressif/esp-idf.git
 	@echo "Installing esp-idf for esp32c3..."
 	cd esp-idf && ./install.sh esp32c3
 	@echo "ESP-IDF for esp32c3 installed successfully."

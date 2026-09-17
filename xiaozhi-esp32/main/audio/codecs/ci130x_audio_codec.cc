@@ -1,6 +1,7 @@
 #include "ci130x_audio_codec.h"
 #include "application.h"
 #include "ci130x_protocol.h"
+#include "latency_tracker.h"
 #include "settings.h"
 #include "moinai_device_settings.h"
 #include <esp_log.h>
@@ -23,6 +24,10 @@ static constexpr uint32_t kPlayGetWindowBytes = 4096;
 // while its receive task is blocked pushing PCM into a full player buffer. Unbounded credit is
 // what used to overrun that buffer and silently drop bytes mid-frame.
 static constexpr uint32_t kPlayGetMaxQuotaBytes = 4 * 1920;
+// UART fragmentation and scheduling jitter keep a few 10 ms reads pending even in
+// steady state, so only a backlog deeper than this is treated as accumulated
+// roll-back to drain at burst speed instead of real-time pace.
+static constexpr size_t kPcmBurstThresholdMs = 40;
 static constexpr uint16_t kPowerOnPromptFirstId = 5000;
 static constexpr int32_t kPowerOnPromptCount = 5;
 
@@ -434,10 +439,12 @@ void Ci130xAudioCodec::HandlePacket(uint16_t cmd, const uint8_t* payload, size_t
             break;
         case CI_CMD_VAD_START:
             ESP_LOGI(TAG, "CI130X VAD Start");
+            LatencyTracker::Instance().Mark(LatencyStage::kVadStart);
             if (on_vad_start_) on_vad_start_();
             break;
         case CI_CMD_VAD_END:
         case CI_CMD_PCM_FINISH: {
+            LatencyTracker::Instance().Mark(LatencyStage::kVadEnd);
             // 32 bytes of 16 kHz mono PCM is 1 ms. "closed" is microphone audio the
             // application was not ready to accept yet, which is the head of the utterance;
             // "full" means the RX ring was too small for the burst. Both should read 0.
@@ -523,13 +530,45 @@ void Ci130xAudioCodec::SendPacket(uint16_t cmd, const uint8_t* payload, size_t l
 int Ci130xAudioCodec::Read(int16_t* dest, int samples) {
     // CI130X only sends PCM data during VAD-active periods. UART delivery is
     // fragmented, so accumulate bytes until one complete caller-requested PCM
-    // block is available. Always pace one call to the duration represented by
-    // that block: buffered UART fragments must not turn into a burst of fake
+    // block is available. Normally one call is paced to the duration of that
+    // block: buffered UART fragments must not turn into a burst of fake
     // real-time audio, and each fragment must not be padded as a separate block.
     size_t size_req = samples * sizeof(int16_t);
     const int64_t period_us = std::max<int64_t>(1000,
         static_cast<int64_t>(samples) * 1000000 / input_sample_rate_);
     std::unique_lock<std::mutex> read_lock(pcm_read_mutex_);
+
+    const bool accept_audio = accept_pcm_input_.load() &&
+        !cloud_playing_.load() && !local_playing_.load();
+
+    // Backlog burst: the CI130X replays its roll-back as one UART burst, and a turn
+    // whose ingress opened late starts with hundreds of milliseconds of pending PCM.
+    // Pacing that out at real time made the backlog survive until vad_done, delaying
+    // the turn close by the backlog's own duration. Past this threshold, consume the
+    // backlog unpaced: the encoder does not need real-time input, and no AEC is
+    // configured, so the mic timestamps stay diagnostics-only. The deadline re-arms
+    // on exit, so the reader returns to real-time pacing once the backlog is gone.
+    const size_t burst_threshold_bytes = std::max<size_t>(
+        size_req * 2, input_sample_rate_ / 1000 * 2 * kPcmBurstThresholdMs);
+    if (accept_audio && PendingInputBytes() > burst_threshold_bytes) {
+        size_t bytes_copied = 0;
+        while (bytes_copied < size_req) {
+            size_t received = 0;
+            uint8_t* data = static_cast<uint8_t*>(xRingbufferReceiveUpTo(
+                pcm_rx_ringbuf_, &received, 0, size_req - bytes_copied));
+            if (data == nullptr) {
+                break;
+            }
+            memcpy(reinterpret_cast<uint8_t*>(dest) + bytes_copied, data, received);
+            bytes_copied += received;
+            vRingbufferReturnItem(pcm_rx_ringbuf_, data);
+        }
+        if (bytes_copied < size_req) {
+            memset(reinterpret_cast<uint8_t*>(dest) + bytes_copied, 0, size_req - bytes_copied);
+        }
+        next_pcm_read_deadline_us_ = esp_timer_get_time() + period_us;
+        return samples;
+    }
 
     int64_t now_us = esp_timer_get_time();
     if (next_pcm_read_deadline_us_ == 0 || now_us >= next_pcm_read_deadline_us_) {
@@ -539,8 +578,6 @@ int Ci130xAudioCodec::Read(int16_t* dest, int samples) {
     next_pcm_read_deadline_us_ += period_us;
 
     size_t bytes_copied = 0;
-    const bool accept_audio = accept_pcm_input_.load() &&
-        !cloud_playing_.load() && !local_playing_.load();
     while (accept_audio && bytes_copied < size_req) {
         now_us = esp_timer_get_time();
         if (now_us >= deadline_us) {
@@ -575,12 +612,18 @@ int Ci130xAudioCodec::Read(int16_t* dest, int samples) {
 
 void Ci130xAudioCodec::StartPlaybackSession() {
     tts_session_++;
+    LatencyTracker::Instance().Mark(LatencyStage::kPlayStart);
     play_get_quota_.store(0);
     if (play_get_sem_) xQueueReset(play_get_sem_);
     ESP_LOGI(TAG, "Starting CI130X playback (session=%lu)",
              (unsigned long)tts_session_);
     SendPacket(CI_CMD_PLAY_START, nullptr, 0);
     cloud_playing_.store(true);
+    // A freshly started session has an empty player buffer, and the CI130X would
+    // grant this window itself right after PLAY_START anyway. Pre-granting it lets
+    // the first PCM frame leave without waiting out the PLAY_GET round trip, which
+    // sat on the critical path of every response's first word.
+    play_get_quota_.store(kPlayGetWindowBytes);
 }
 
 int Ci130xAudioCodec::Write(const int16_t* data, int samples) {
@@ -598,6 +641,7 @@ int Ci130xAudioCodec::Write(const int16_t* data, int samples) {
     }
 
     if (!cloud_playing_.load()) {
+        LatencyTracker::Instance().Mark(LatencyStage::kFirstPcmWrite);
         StartPlaybackSession();
     }
 
@@ -716,6 +760,7 @@ void Ci130xAudioCodec::NotifyOutputStreamEnd() {
 
 void Ci130xAudioCodec::ReportTtsPlaybackFinished() {
     tts_stream_completion_pending_.store(false);
+    LatencyTracker::Instance().FinishTurn();
     if (on_tts_end_) {
         on_tts_end_();
     }

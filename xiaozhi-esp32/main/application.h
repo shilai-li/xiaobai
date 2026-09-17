@@ -129,13 +129,30 @@ public:
     // recognizing any text. Safe to call from the protocol receive task.
     void RestartListeningAfterEmptyAsr();
 
+    // Single source of truth for "the asr_done text carries no recognized
+    // speech". Both the empty-turn restart path and the success-prompt path
+    // must agree on this, or a turn could ring the prompt and then be
+    // treated as empty (or the reverse).
+    static bool IsAsrTextEmpty(const char* text);
+
+    // Endpoint confirmation prompt: played when asr_done carries text, which
+    // guarantees downstream llm_*/tts events. Safe to call from the protocol
+    // receive task.
+    void PlayAsrSuccessPrompt();
+
 #if CONFIG_BOARD_TYPE_ESP32C3_CI130X
-    // Hold one CI130X VAD segment locally until the chip has had a chance to
-    // classify it as an offline command. These methods are thread-safe.
-    void BeginCi130xLocalCommandAudioGate();
-    void ReleaseCi130xLocalCommandAudioGate();
-    void DiscardCi130xLocalCommandAudioGate();
+    // Drop uplink packets still queued when a local command revokes the turn.
+    // Speech streams out in real time, so only the final frame or two remain.
+    // Thread-safe.
+    void DiscardCi130xPendingUplink();
 #endif
+
+    // Revoke the active cloud turn by sending cancel_turn to the server, which
+    // aborts its ASR/LLM/TTS pipeline and suppresses further messages of that
+    // turn. No-op (nothing sent) when no turn is active, which also makes
+    // consecutive cancels idempotent. Call from the main task so the send is
+    // serialized with SEND_AUDIO processing.
+    void CancelActiveCloudTurn(const char* reason);
 
     /**
      * Stop listening (event-based, thread-safe)
@@ -205,9 +222,10 @@ private:
     // Bumped by every user wake word or button press that is not the topic's
     // own playback handoff. The poll task compares it across a fetch.
     std::atomic<uint32_t> user_wakeup_seq_{0};
-#if CONFIG_BOARD_TYPE_ESP32C3_CI130X
-    std::atomic<bool> ci130x_local_command_audio_gate_{false};
-#endif
+    // True while a cloud turn is active (start_talk sent or topic TTS delivery
+    // in flight), i.e. a turn the server could still be processing. Guards
+    // cancel_turn so it is only sent when there is something to revoke.
+    std::atomic<bool> cloud_turn_active_{false};
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;

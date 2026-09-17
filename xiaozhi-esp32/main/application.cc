@@ -13,6 +13,7 @@
 #include "assets.h"
 #include "settings.h"
 #include "moinai_device_settings.h"
+#include "latency_tracker.h"
 
 #include <cstring>
 #include <algorithm>
@@ -118,6 +119,8 @@ bool Application::SetDeviceState(DeviceState state) {
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
+    // Boot marker: confirms the running firmware carries the latency tracker.
+    ESP_LOGI("Latency", "tracker v2 armed");
 
     // Setup the display
     auto display = board.GetDisplay();
@@ -320,17 +323,11 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (true) {
-#if CONFIG_BOARD_TYPE_ESP32C3_CI130X
-                // Recheck before every packet: VAD start arrives on the UART task and can
-                // close the gate while the main task is draining pre-VAD silence.
-                if (ci130x_local_command_audio_gate_.load()) {
-                    break;
-                }
-#endif
                 auto packet = audio_service_.PopPacketFromSendQueue();
                 if (!packet) {
                     break;
                 }
+                LatencyTracker::Instance().RecordUplinkPacket(packet->mic_capture_time_us);
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
@@ -918,6 +915,9 @@ void Application::TopicPollTask() {
                     item.awaiting_delivery = true;
                     item.delivery_started = false;
                     item.delivery_deadline = now + pdMS_TO_TICKS(kTopicStartTimeoutMs);
+                    // The topic TTS is a server-side turn too; interrupting its
+                    // playback (button/wake word) revokes it with cancel_turn.
+                    cloud_turn_active_.store(true);
                     if (!protocol_->SendTts(item.topic.id, item.topic.text)) {
                         topic_tts_failed_.store(true);
                     }
@@ -1184,6 +1184,7 @@ void Application::InitializeProtocol() {
                 // Start buffering synchronously before returning to the
                 // WebSocket receive loop so the first 60 ms packets cannot race
                 // the scheduled speaking-state transition.
+                LatencyTracker::Instance().Mark(LatencyStage::kTtsStart);
 #if CONFIG_BOARD_TYPE_ESP32C3_CI130X
                 static_cast<Ci130xAudioCodec*>(
                     Board::GetInstance().GetAudioCodec())->SetTopicPlayback(
@@ -1205,6 +1206,7 @@ void Application::InitializeProtocol() {
                     topic_tts_started_.store(true);
                 }
             } else if (strcmp(state->valuestring, "stop") == 0) {
+                LatencyTracker::Instance().Mark(LatencyStage::kTtsStop);
                 const bool topic_delivery = topic_tts_delivery_pending_.load();
                 if (topic_delivery) {
                     topic_tts_done_.store(true);
@@ -1354,6 +1356,24 @@ void Application::StartListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING);
 }
 
+bool Application::IsAsrTextEmpty(const char* text) {
+    return text == nullptr || text[0] == '\0';
+}
+
+void Application::PlayAsrSuccessPrompt() {
+    Schedule([this]() {
+        // A turn revoked by a local command drops back to Idle before the
+        // server's in-flight asr_done arrives (~RTT race window); the prompt
+        // must not promise an answer for that dead turn.
+        if (!protocol_ || !protocol_->IsAudioChannelOpened() ||
+            GetDeviceState() != kDeviceStateConnecting) {
+            return;
+        }
+        ESP_LOGI(TAG, "ASR recognized speech; playing success prompt");
+        PlaySound(Lang::Sounds::OGG_SUCCESS);
+    });
+}
+
 void Application::RestartListeningAfterEmptyAsr() {
     Schedule([this]() {
         if (!protocol_ || !protocol_->IsAudioChannelOpened() ||
@@ -1380,37 +1400,36 @@ void Application::RestartListeningAfterEmptyAsr() {
 }
 
 #if CONFIG_BOARD_TYPE_ESP32C3_CI130X
-void Application::BeginCi130xLocalCommandAudioGate() {
-    ci130x_local_command_audio_gate_.store(true);
-    // A new VAD segment must never inherit queued silence or audio from the
-    // previous turn. PopPacketFromSendQueue() owns the queue lock.
-    while (audio_service_.PopPacketFromSendQueue()) {}
-    ESP_LOGI(TAG, "Holding CI130X utterance for local-command classification");
-}
-
-void Application::ReleaseCi130xLocalCommandAudioGate() {
-    if (!ci130x_local_command_audio_gate_.exchange(false)) {
-        return;
-    }
-    ESP_LOGI(TAG, "CI130X utterance is not local; releasing held audio");
-    xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
-}
-
-void Application::DiscardCi130xLocalCommandAudioGate() {
-    if (!ci130x_local_command_audio_gate_.load()) {
-        return;
-    }
-
+void Application::DiscardCi130xPendingUplink() {
+    // Speech streams to the server in real time; a local command revokes the turn
+    // only after most of its audio has already gone out. Drop whatever packets are
+    // still queued (at most a frame or two) so the tail cannot leak into the next
+    // turn. CancelCloudSession() performs a second drain after the encoder idles.
     size_t discarded_packets = 0;
     while (audio_service_.PopPacketFromSendQueue()) {
         discarded_packets++;
     }
-    ESP_LOGI(TAG, "Discarded %u held audio packet(s) for local command",
+    ESP_LOGI(TAG, "Discarded %u pending uplink packet(s) for local command",
              static_cast<unsigned>(discarded_packets));
-    // Keep the gate closed until the next VAD segment. The encoder can still
-    // finish a frame while cancellation is being scheduled; it must not leak.
 }
 #endif
+
+void Application::CancelActiveCloudTurn(const char* reason) {
+    // A revoked turn never finishes playback, so close its latency report now;
+    // otherwise its stale marks (VAD end without vad_done) corrupt the next
+    // turn's report. Unconditional: stale marks may exist even when no
+    // cancel_turn goes out (turn already torn down, double cancel).
+    LatencyTracker::Instance().AbortTurn();
+    // exchange(false) both tests and clears, so consecutive cancels of the same
+    // turn (e.g. command 100 followed by ExitWakeup) send exactly one event.
+    if (!cloud_turn_active_.exchange(false)) {
+        return;
+    }
+    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+        protocol_->SendCancelTurn(reason);
+        ESP_LOGI(TAG, "Cancelled active cloud turn: %s", reason);
+    }
+}
 
 void Application::StopListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
@@ -1640,19 +1659,11 @@ void Application::HandleStopListeningEvent() {
     } else if (state == kDeviceStateListening) {
         if (protocol_) {
 #if CONFIG_BOARD_TYPE_ESP32C3_CI130X
-            // A button release can arrive before CI130X classifies the segment.
-            // Leave recording active; OnVadEnd will release the gate and request
-            // the stop again if no local command consumed the utterance.
-            if (ci130x_local_command_audio_gate_.load()) {
-                ESP_LOGI(TAG, "Deferring vad_done while local-command audio is gated");
-                return;
-            }
-
-            // The CI130X delivers its roll-back as a burst, and Read() is paced to real time,
-            // so the codec carries that backlog for the whole turn. Stopping the processor
-            // with PCM still in it would discard the end of the utterance, so let the input
-            // task consume it first. The wait is roughly the backlog's own duration and is
-            // bounded, because vad_done must not wait on a codec that stopped delivering.
+            // The CI130X delivers its roll-back as a burst, so the codec can still carry
+            // a tail of the utterance when the VAD ends. Stopping the processor with PCM
+            // still in it would discard the end of the utterance, so let the input task
+            // consume it first. The wait is short, because the burst read path drains the
+            // backlog without real-time pacing.
             auto* ci130x_codec = static_cast<Ci130xAudioCodec*>(
                 Board::GetInstance().GetAudioCodec());
             const int64_t drain_deadline_us =
@@ -1665,21 +1676,18 @@ void Application::HandleStopListeningEvent() {
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
+            LatencyTracker::Instance().Mark(LatencyStage::kMicDrainDone);
 #endif
             // Stop producing audio first, then preserve wire order: every completed
             // Opus frame must reach the server before the vad_done marker.
             audio_service_.EnableVoiceProcessing(false);
             auto drain_send_queue = [this](const char* failure_message) {
                 while (true) {
-#if CONFIG_BOARD_TYPE_ESP32C3_CI130X
-                    if (ci130x_local_command_audio_gate_.load()) {
-                        return false;
-                    }
-#endif
                     auto packet = audio_service_.PopPacketFromSendQueue();
                     if (!packet) {
                         return true;
                     }
+                    LatencyTracker::Instance().RecordUplinkPacket(packet->mic_capture_time_us);
                     if (!protocol_->SendAudio(std::move(packet))) {
                         ESP_LOGW(TAG, "%s", failure_message);
                         return true;
@@ -1687,17 +1695,15 @@ void Application::HandleStopListeningEvent() {
                 }
             };
             if (!drain_send_queue("Failed to drain audio before vad_done")) {
-                audio_service_.EnableVoiceProcessing(true);
-                ESP_LOGI(TAG, "New gated utterance preempted vad_done drain");
                 return;
             }
             audio_service_.WaitForUplinkEncodeIdle();
+            LatencyTracker::Instance().Mark(LatencyStage::kEncodeIdle);
             if (!drain_send_queue("Failed to send final audio frame before vad_done")) {
-                audio_service_.EnableVoiceProcessing(true);
-                ESP_LOGI(TAG, "New gated utterance preempted final vad_done drain");
                 return;
             }
             protocol_->SendStopListening();
+            LatencyTracker::Instance().Mark(LatencyStage::kVadDoneSent);
         }
         // vad_done completes microphone upload, but the conversation is still
         // active while the server prepares its response. Do not enter standby
@@ -1814,6 +1820,10 @@ void Application::HandleStateChangedEvent() {
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateIdle:
+            // Every turn teardown path funnels through Idle (local-command
+            // cancellation, wake-up revocation, finished response, empty ASR,
+            // topic completion), so clear the active-turn guard here.
+            cloud_turn_active_.store(false);
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
@@ -1841,6 +1851,7 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
+            LatencyTracker::Instance().Mark(LatencyStage::kListeningState);
 
             if (topic_listening_after_playback_.exchange(false) &&
                 topic_listening_timer_handle_ != nullptr) {
@@ -1874,6 +1885,9 @@ void Application::HandleStateChangedEvent() {
 
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
+                // start_talk marks a fresh server-side turn; a later local
+                // command/wakeup revocation has something to cancel.
+                cloud_turn_active_.store(true);
                 audio_service_.EnableVoiceProcessing(true);
             }
 

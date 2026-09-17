@@ -128,7 +128,7 @@ private:
             auto& app = Application::GetInstance();
             if (app.PreemptTopicDeliveryForUserWakeup()) {
                 ESP_LOGI(TAG, "Button interrupted topic delivery; prioritizing user listening.");
-                CancelCloudSession(true);
+                CancelCloudSession("topic_preempted", true);
                 return;
             }
             auto codec = (Ci130xAudioCodec*)Board::GetInstance().GetAudioCodec();
@@ -141,8 +141,10 @@ private:
     }
 
     // Cancel any active cloud session when a local event (wake word / offline command) takes priority.
-    // Called from UART thread context - all APIs used here are thread-safe.
-    static void CancelCloudSession(bool restart_listening = false) {
+    // `reason` tags the cancel_turn event sent to the server: local_command,
+    // user_wakeup, topic_preempted or wakeup_exit. Called from UART thread
+    // context - all APIs used here are thread-safe.
+    static void CancelCloudSession(const char* reason, bool restart_listening = false) {
         auto& app = Application::GetInstance();
         auto state = app.GetDeviceState();
         if (state != kDeviceStateIdle && state != kDeviceStateConnecting &&
@@ -153,7 +155,7 @@ private:
         // 1. Suppress any pending VadStart from starting a cloud session.
         s_suppress_cloud_start.store(true);
         s_pending_vad_end.store(false);
-        app.DiscardCi130xLocalCommandAudioGate();
+        app.DiscardCi130xPendingUplink();
 
         // Block the next incoming TTS stream immediately. All Write() calls will be dropped
         // until ClearTtsBlock() is called (before the next StartListening).
@@ -167,8 +169,14 @@ private:
         s_last_cancel_time = esp_timer_get_time() / 1000;
 
         // 4. Handle state-specific cancellation in the main task
-        app.Schedule([codec, restart_listening]() {
+        app.Schedule([codec, reason, restart_listening]() {
             auto& app = Application::GetInstance();
+            // Revoke the server-side turn first: sending from the scheduled
+            // lambda serializes the cancel with SEND_AUDIO, so frames queued
+            // before it are cancelled server-side and none follow it (the
+            // drains below already emptied the send queue). For the restart
+            // path this also guarantees the wire order cancel -> start_talk.
+            app.CancelActiveCloudTurn(reason);
             auto current_state = app.GetDeviceState();
             // Reuse the healthy WebSocket only for an active cloud-TTS
             // barge-in. All other re-wakeups must go through Idle so the old
@@ -273,7 +281,7 @@ public:
                     ESP_LOGI(TAG, "Wakeup interrupted topic delivery; prioritizing user listening.");
                     s_ignore_wakeup_local_play_until_ms.store(
                         esp_timer_get_time() / 1000 + 1000);
-                    CancelCloudSession(true);
+                    CancelCloudSession("topic_preempted", true);
                     return;
                 }
                 if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
@@ -284,12 +292,12 @@ public:
                         ESP_LOGI(TAG, "Wakeup: Re-wakeup while already awake, restarting listening session directly.");
                         s_ignore_wakeup_local_play_until_ms.store(
                             esp_timer_get_time() / 1000 + 1000);
-                        CancelCloudSession(true);
+                        CancelCloudSession("user_wakeup", true);
                     } else {
                         // First wakeup but cloud session was started by OnVadStart before CI130x
                         // recognized the wake word. Cancel fully - the audio was not a real query.
                         ESP_LOGI(TAG, "Wakeup: Already in cloud session, cancelling.");
-                        CancelCloudSession();
+                        CancelCloudSession("user_wakeup");
                     }
                 } else {
                     // No cloud session active - normal first wakeup
@@ -302,13 +310,13 @@ public:
             audio_codec.OnAsrResult([](uint16_t cmd_id) {
                 ESP_LOGI(TAG, "ASR Result: Offline command detected, cmd_id: %d", cmd_id);
                 if (cmd_id == 100) {
-                    CancelCloudSession();
+                    CancelCloudSession("local_command");
                 } else if ((cmd_id >= 3 && cmd_id <= 6) || (cmd_id >= 9 && cmd_id <= 10) || (cmd_id >= 302 && cmd_id <= 314)) {
                     auto& app = Application::GetInstance();
                     auto state = app.GetDeviceState();
                     if (state != kDeviceStateSpeaking) {
                         ESP_LOGI(TAG, "ASR Result: Non-interrupt command %d detected while not speaking, cancelling cloud session.", cmd_id);
-                        CancelCloudSession();
+                        CancelCloudSession("local_command");
                     } else {
                         ESP_LOGI(TAG, "ASR Result: Non-interrupt command %d detected while speaking, ignoring to keep speaking.", cmd_id);
                     }
@@ -320,7 +328,7 @@ public:
             // Exit wakeup (e.g. offline command 100 or timeout): cancel active cloud session and stop playback
             audio_codec.OnExitWakeup([]() {
                 ESP_LOGI(TAG, "Exit Wakeup: Offline command 100 or timeout detected.");
-                CancelCloudSession();
+                CancelCloudSession("wakeup_exit");
                 // IsAwake() is already false, so Idle no longer keeps the socket. A device that was
                 // Idle all along produces no transition, so release the channel explicitly.
                 Application::GetInstance().Schedule([]() {
@@ -350,7 +358,7 @@ public:
                 auto state = app.GetDeviceState();
                 if (state == kDeviceStateSpeaking) {
                     ESP_LOGI(TAG, "Local Play Start: Cloud session active while speaking, cancelling immediately.");
-                    CancelCloudSession();
+                    CancelCloudSession("local_command");
                 }
             });
 
@@ -361,9 +369,10 @@ public:
                 auto& app = Application::GetInstance();
                 const auto state = app.GetDeviceState();
                 if (state != kDeviceStateSpeaking && audio_codec.IsAwake()) {
-                    // CI130X reports VAD start before streaming this segment's PCM. Close the
-                    // uplink gate here in the UART task so no speech packet can win the race.
-                    app.BeginCi130xLocalCommandAudioGate();
+                    // Speech used to be gated here until local-command classification, and
+                    // released in a burst on VAD end. Now it streams to the server in real
+                    // time like the silence frames, and a local command revokes the whole
+                    // turn through CancelCloudSession() instead.
                 }
                 if (state == kDeviceStateListening) {
                     // This turn now holds speech the server is waiting to have finalised.
@@ -416,9 +425,6 @@ public:
                 }
                 auto& app = Application::GetInstance();
                 const auto state = app.GetDeviceState();
-                // No local ASR result cancelled this segment, so it belongs to the cloud.
-                // Release before StopListening() drains the queue and emits vad_done.
-                app.ReleaseCi130xLocalCommandAudioGate();
                 if (state == kDeviceStateListening) {
                     app.StopListening();
                 } else if (state == kDeviceStateConnecting) {

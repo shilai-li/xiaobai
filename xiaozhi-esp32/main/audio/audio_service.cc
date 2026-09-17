@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include "latency_tracker.h"
 #include <esp_log.h>
 #include <algorithm>
 #include <cstring>
@@ -318,6 +319,7 @@ void AudioService::AudioOutputTask() {
             if (streaming_playback_finished_ ||
                 buffered_ms >= streaming_prebuffer_ms_) {
                 streaming_playback_ready_ = true;
+                LatencyTracker::Instance().Mark(LatencyStage::kPlaybackReady);
                 ESP_LOGI(TAG, "Streaming playback ready with %u ms buffered",
                          static_cast<unsigned>(buffered_ms));
                 return true;

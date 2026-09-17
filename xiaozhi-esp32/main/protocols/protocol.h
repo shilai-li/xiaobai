@@ -78,6 +78,11 @@ public:
     virtual void SendWakeWordDetected(const std::string& wake_word);
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();
+    // Revoke the active turn on the server (cancel_turn event): abort ASR/LLM/TTS
+    // and suppress any further messages for that turn. Reason is a free-form tag
+    // for server-side analytics (local_command / user_wakeup / topic_preempted /
+    // wakeup_exit).
+    virtual void SendCancelTurn(const std::string& reason);
     virtual void SendAbortSpeaking(AbortReason reason);
     virtual void SendMcpMessage(const std::string& message);
     bool SendTts(const std::string& id, const std::string& text);

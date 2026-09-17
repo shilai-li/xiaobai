@@ -243,7 +243,7 @@ static void pre_blue(const char* msg)
 #define POWER_OFF_AUDIO_TIMEOUT_MS  8000
 /* Used until the backend sends its sleepTime. The panel must not stay lit
  * forever if that packet never arrives. */
-#define HIBERNATION_TIMEOUT_DEFAULT_SECONDS 60U
+#define HIBERNATION_TIMEOUT_DEFAULT_SECONDS 300U
 #define HIBERNATION_VOICE_FIRST_ID  5010U
 #define HIBERNATION_VOICE_COUNT     5U
 #define POWER_OFF_VOICE_FIRST_ID    5015U

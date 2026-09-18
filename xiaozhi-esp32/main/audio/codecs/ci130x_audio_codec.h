@@ -52,6 +52,17 @@ private:
     bool is_awake_ = false;
     uint32_t tts_session_ = 0;
     std::atomic<uint32_t> play_get_quota_{0};
+    // Non-stream sound accounting: frames queued via NotifySoundFrames() that
+    // have not been written to the CI130X yet. Write() counts them down; the
+    // frame that takes the counter to zero is the sound's true last frame.
+    std::atomic<uint32_t> sound_frames_pending_{0};
+    // Session-scoped: PLAY_DATA_END has been sent and the session now only
+    // waits for the chip's PLAY_STOP_EVT. Selects the watchdog's fallback stage.
+    std::atomic<bool> end_declared_{false};
+    // Declaration-scoped: a PLAY_STOP_EVT is still in flight (end declared or
+    // stop issued). Restart paths wait it out before PLAY_START, otherwise the
+    // late stop event kills the freshly started session.
+    std::atomic<bool> stop_evt_expected_{false};
     esp_timer_handle_t playback_timer_ = nullptr;
     esp_timer_handle_t local_play_fallback_timer_ = nullptr;
     // Set when the backend has finished emitting startup statuses. The voice is
@@ -72,6 +83,7 @@ private:
     void InitializeUart();
     void StartRxTask();
     void StartPlaybackSession();
+    void QuiescePendingPlaybackStop();
     static void RxTask(void* arg);
     static void OnPlaybackTimer(void* arg);
     static void OnLocalPlayFallbackTimer(void* arg);
@@ -97,6 +109,7 @@ public:
     virtual int OutputBufferedMs() const override;
     virtual void NotifyOutputStreamStart() override;
     virtual void NotifyOutputStreamEnd() override;
+    virtual void NotifySoundFrames(size_t count) override;
     // PLAY_TTS_END arrives only after the CI130X has played the PCM it still holds, which is
     // seconds after the server stopped sending it.
     virtual bool PlaybackCompletionIsAsync() const override { return true; }

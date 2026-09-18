@@ -839,19 +839,26 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     const auto* buf = reinterpret_cast<const uint8_t*>(ogg.data());
     size_t size = ogg.size();
 
+    size_t frame_count = 0;
     auto demuxer = std::make_unique<OggDemuxer>();
-    demuxer->OnDemuxerFinished([this](const uint8_t* data, int sample_rate, size_t size){
+    demuxer->OnDemuxerFinished([this, &frame_count](const uint8_t* data, int sample_rate, size_t size){
         auto packet = std::make_unique<AudioStreamPacket>();
         packet->sample_rate = sample_rate;
         packet->frame_duration = 60;
         packet->payload.resize(size);
         std::memcpy(packet->payload.data(), data, size);
         PushPacketToDecodeQueue(std::move(packet), true);
+        frame_count++;
     });
     demuxer->Reset();
     demuxer->Process(buf, size);
-    // The whole sound is queued by now, so the codec may finish its session as soon as it drains.
-    codec_->NotifyOutputStreamEnd();
+    // Tell the codec how many frames this sound consists of: it declares the
+    // session end once the last frame has actually been written, so the chip
+    // can answer with a real PLAY_STOP_EVT. The old NotifyOutputStreamEnd
+    // call here fired before the first frame was even written and never
+    // reached the CI130X (no session existed yet), leaving the idle watchdog
+    // to guess the end from write gaps.
+    codec_->NotifySoundFrames(frame_count);
 }
 
 bool AudioService::IsIdle() {

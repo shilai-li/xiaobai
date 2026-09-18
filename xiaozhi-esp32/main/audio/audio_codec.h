@@ -35,6 +35,10 @@ public:
     // (e.g. one CI130X playback session) use this instead of guessing from write gaps.
     virtual void NotifyOutputStreamStart() {}
     virtual void NotifyOutputStreamEnd() {}
+    // A batch of `count` frames was queued for a non-stream sound (PlaySound).
+    // Codecs that need an explicit end declaration count the frames down and end
+    // the session after the last one is written instead of guessing from gaps.
+    virtual void NotifySoundFrames(size_t count) { (void)count; }
     // True when the codec reports the end of playback itself, well after the last sample was
     // written. The speaking turn must then wait for that report instead of ending as soon as the
     // server stops sending audio.

@@ -34,6 +34,8 @@ set(SOURCES "audio/audio_codec.cc"
             "system_info.cc"
             "application.cc"
             "ota.cc"
+            "ota_image_writer.cc"
+            "local_ota_server.cc"
             "settings.cc"
             "moinai_device_settings.cc"
             "device_state_machine.cc"
@@ -990,6 +992,9 @@ idf_component_register(SRCS ${SOURCES}
                         esp_pm
                         esp_psram
                         esp_netif
+                        esp_event
+                        esp_wifi
+                        esp_http_server
                         esp_driver_gpio
                         esp_driver_uart
                         esp_driver_usb_serial_jtag

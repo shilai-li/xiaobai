@@ -18,6 +18,7 @@
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
 #include "moinai_device_settings.h"
+#include "ota_feature_config.h"
 
 #define TAG "MCP"
 
@@ -178,6 +179,7 @@ void McpServer::AddUserOnlyTools() {
         });
 
     // Firmware upgrade
+#if CLOUD_OTA_ENABLED
     AddUserOnlyTool("self.upgrade_firmware", "Upgrade firmware from a specific URL. This will download and install the firmware, then reboot the device.",
         PropertyList({
             Property("url", kPropertyTypeString, "The URL of the firmware binary file to download and install")
@@ -196,6 +198,7 @@ void McpServer::AddUserOnlyTools() {
             
             return true;
         });
+#endif
 
     // Display control
 #ifdef HAVE_LVGL

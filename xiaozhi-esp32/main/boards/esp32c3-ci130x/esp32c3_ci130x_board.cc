@@ -3,6 +3,8 @@
 #include "application.h"
 #include "button.h"
 #include "config.h"
+#include "local_ota_server.h"
+#include "ota_feature_config.h"
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <atomic>
@@ -224,6 +226,9 @@ public:
     Esp32c3Ci130xBoard() : Ml307Board(ML307_TX_PIN, ML307_RX_PIN, ML307_DTR_PIN),
         boot_button_(BOOT_BUTTON_GPIO) {
         InitializeButtons();
+#if LOCAL_AP_OTA_ENABLED
+        LocalOtaServer::Start();
+#endif
     }
 
     // While the CI130X stays awake the next turn starts on VAD, i.e. the user is already talking.

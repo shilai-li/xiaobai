@@ -207,19 +207,28 @@ static std::string MaskMoinaiToken(const std::string& token) {
 
 static esp_err_t MapMoinaiHttpError(int status, const std::string& response) {
     const std::string code = GetMoinaiBusinessErrorCode(response);
+    esp_err_t mapped;
     if (code == "NOT_READY_SHIPMENT") {
-        return Ota::kErrNotReadyShipment;
+        mapped = Ota::kErrNotReadyShipment;
+    } else if (code == "ALREADY_ACTIVATED") {
+        mapped = Ota::kErrAlreadyActivated;
+    } else if (code == "DEVICE_NOT_ACTIVATED") {
+        mapped = Ota::kErrDeviceNotActivated;
+    } else if (status == 401 || status == 403) {
+        // 403 is included because Moinai returns it for an expired token;
+        // mapping it to kErrUnauthorized lets the caller trigger a refresh.
+        mapped = Ota::kErrUnauthorized;
+    } else {
+        mapped = ESP_FAIL;
     }
-    if (code == "ALREADY_ACTIVATED") {
-        return Ota::kErrAlreadyActivated;
-    }
-    if (code == "DEVICE_NOT_ACTIVATED") {
-        return Ota::kErrDeviceNotActivated;
-    }
-    if (status == 401) {
-        return Ota::kErrUnauthorized;
-    }
-    return ESP_FAIL;
+    // Trace every mapping decision: which HTTP status, which business code the
+    // server embedded, and what the caller will act on. kErrUnauthorized here
+    // is the trigger for the token-refresh path in Application.
+    ESP_LOGW(TAG, "Moinai HTTP error mapped: status=%d, business_code='%s', "
+                  "esp_err=0x%x, action=%s",
+             status, code.c_str(), mapped,
+             mapped == Ota::kErrUnauthorized ? "refresh token" : "no token refresh");
+    return mapped;
 }
 
 Ota::Ota() {
@@ -304,6 +313,7 @@ esp_err_t Ota::GetMoinaiToken(std::string& token_out, int64_t& expires_at_ms_out
         base_url.pop_back();
     }
     std::string auth_url = base_url + "/api/v1/embeded/auth/device/" + device_id;
+    ESP_LOGI(TAG, "Auth request to: %s", auth_url.c_str());
 
     // The auth API only accepts timestamps within 15 minutes of *server* time.
     // The device clock (SNTP) can be unreachable or wrong behind proxy networks,
@@ -546,6 +556,65 @@ esp_err_t Ota::CheckVersion() {
     return ESP_OK;
 }
 
+// Fall back to the server's HTTP Date header when the modem clock (CCLK) is
+// unavailable. Any response — including 401 — carries a Date header, so this
+// works regardless of token validity. Returns true if the local clock was set.
+bool Ota::SyncTimeFromHttpDate() {
+    std::string base_url = GetCheckVersionUrl();
+    if (base_url.back() == '/') {
+        base_url.pop_back();
+    }
+    std::string settings_url = base_url + "/api/v1/embeded/device/settings/" + serial_number_;
+    ESP_LOGI(TAG, "Clock sync via HTTP Date from: %s", settings_url.c_str());
+    struct timeval before = {};
+    gettimeofday(&before, nullptr);
+    auto http = SetupHttp(moinai_token_);
+    if (!http->Open("GET", settings_url)) {
+        ESP_LOGW(TAG, "Clock sync via HTTP Date failed: could not reach server");
+        return false;
+    }
+    // Open() returns as soon as AT+MHTTPREQUEST is accepted; response headers
+    // arrive later via the +MHTTPURC "header" URC. GetStatusCode() blocks until
+    // then (or times out with -1). Any status — including 401/403 — carries a
+    // Date header, so proceed regardless of the status value.
+    const int status = http->GetStatusCode();
+    if (status < 0) {
+        ESP_LOGW(TAG, "Clock sync via HTTP Date failed: no response headers received (status=%d)",
+                 status);
+        http->Close();
+        return false;
+    }
+    ESP_LOGI(TAG, "Clock sync response received: status=%d", status);
+    const std::string server_date = http->GetResponseHeader("Date");
+    http->Close();
+    if (server_date.empty()) {
+        ESP_LOGW(TAG, "Clock sync via HTTP Date failed: response (status=%d) has no Date header",
+                 status);
+        return false;
+    }
+
+    const time_t server_epoch = ParseHttpDate(server_date);
+    if (server_epoch <= 0) {
+        ESP_LOGW(TAG, "Clock sync via HTTP Date failed: unparsable Date header '%s' (status=%d)",
+                 server_date.c_str(), status);
+        return false;
+    }
+    struct timeval server_tv = { server_epoch, 0 };
+    settimeofday(&server_tv, nullptr);
+    struct tm utc_tm = {};
+    char utc_text[32] = "unknown";
+    if (gmtime_r(&server_epoch, &utc_tm) != nullptr) {
+        strftime(utc_text, sizeof(utc_text), "%Y-%m-%dT%H:%M:%SZ", &utc_tm);
+    }
+    const int64_t clock_adjust_s = static_cast<int64_t>(server_epoch) - before.tv_sec;
+    ESP_LOGI(TAG, "System time synchronized from HTTP Date header: status=%d, date='%s', "
+                  "utc=%s, epoch=%lld, clock_adjust=%llds",
+             status, server_date.c_str(), utc_text,
+             static_cast<long long>(server_epoch),
+             static_cast<long long>(clock_adjust_s));
+    return true;
+}
+
 esp_err_t Ota::RefreshMoinaiToken() {
     // Cached-token startup intentionally skips clock sync. Any path that really
     // needs to sign an auth request (cache miss or 401 recovery) must restore a
@@ -556,7 +625,7 @@ esp_err_t Ota::RefreshMoinaiToken() {
     const bool clock_valid = gmtime_r(&refresh_time.tv_sec, &utc_tm) != nullptr &&
                              utc_tm.tm_year + 1900 >= 2023 && utc_tm.tm_year + 1900 <= 2037;
     if (!clock_valid) {
-        if (!Board::GetInstance().SyncSystemTime()) {
+        if (!Board::GetInstance().SyncSystemTime() && !SyncTimeFromHttpDate()) {
             ESP_LOGE(TAG, "Unable to synchronize system time before Moinai token refresh");
             return ESP_ERR_TIMEOUT;
         }
@@ -602,11 +671,18 @@ esp_err_t Ota::ValidateCachedMoinaiToken() {
     const bool clock_valid = gmtime_r(&now.tv_sec, &utc_tm) != nullptr &&
                              utc_tm.tm_year + 1900 >= 2023 && utc_tm.tm_year + 1900 <= 2037;
     if (!clock_valid) {
-        if (!Board::GetInstance().SyncSystemTime()) {
-            ESP_LOGW(TAG, "Deferred token expiry validation could not synchronize time");
-            return ESP_ERR_TIMEOUT;
+        if (!Board::GetInstance().SyncSystemTime() && !SyncTimeFromHttpDate()) {
+            // Degrade to a warning instead of failing activation: with a
+            // stale clock the expiry check below is merely optimistic (the
+            // token looks far from expiry and is kept as-is), and the
+            // subsequent device settings call only needs the Bearer token,
+            // not a local timestamp signature. If the token has actually
+            // expired, the server rejects it and the refresh path re-syncs
+            // the clock from the server's Date header.
+            ESP_LOGW(TAG, "Time sync failed; continuing token validation with unsynchronized clock");
+        } else {
+            gettimeofday(&now, nullptr);
         }
-        gettimeofday(&now, nullptr);
     }
 
     const int64_t now_ms = static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_usec / 1000;

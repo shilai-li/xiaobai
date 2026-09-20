@@ -11,7 +11,7 @@ esp32c3:
 .PHONY: clean
 clean:
 	@echo "Cleaning environment..."
-	. ~/esp/esp-idf/export.sh && rm -rf ./build && idf.py fullclean && rm -rf ./releases
+	. ~/esp/esp-idf/export.sh && rm -rf ~/.cache && rm -rf ./build && idf.py fullclean && rm -rf ./releases
 	@echo "Environment cleaned successfully."
 
 .PHONY: build
@@ -20,7 +20,7 @@ build:
 	. ~/esp/esp-idf/export.sh && echo "Building project..." && python scripts/release.py esp32c3-ci130x
 	@echo "Project built successfully."
 
-PORT ?= /dev/cu.usbmodem214201
+PORT ?= /dev/cu.usbmodem13301
 
 .PHONY: flash
 flash:

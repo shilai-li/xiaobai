@@ -393,6 +393,12 @@ bool Ml307Board::SyncSystemTime() {
     constexpr int kTimeSyncRetryMs = 200;
     constexpr int kMinValidYear = 2023;
     constexpr int kMaxValidYear = 2037;
+    // A parse failure is deterministic: AtUart splits URC arguments on commas
+    // without quote awareness, so a quoted +CCLK value ("26/09/18,08:15:30+32")
+    // can never yield the 8 fields sscanf expects. Retrying cannot fix it, so
+    // bail out quickly and let the caller fall back to HTTP Date sync.
+    constexpr int kMaxParseFailures = 2;
+    int parse_failures = 0;
 
     for (int attempt = 1; attempt <= kTimeSyncAttempts; ++attempt) {
         // AtUart classifies +CCLK as a URC, so it is not retained in
@@ -434,6 +440,12 @@ bool Ml307Board::SyncSystemTime() {
                                        &timezone_sign, &timezone_quarters);
         if (fields != 8 || (timezone_sign != '+' && timezone_sign != '-')) {
             ESP_LOGW(TAG, "Unable to parse ML307 clock: %s", clock_value.c_str());
+            if (++parse_failures >= kMaxParseFailures) {
+                ESP_LOGW(TAG,
+                         "ML307 clock parsing keeps failing (URC argument truncation); "
+                         "giving up after %d attempts", parse_failures);
+                return false;
+            }
             vTaskDelay(pdMS_TO_TICKS(kTimeSyncRetryMs));
             continue;
         }

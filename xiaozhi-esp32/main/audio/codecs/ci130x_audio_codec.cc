@@ -19,6 +19,18 @@ static const uint8_t* HEADER = CIAS_HEADER;
 static constexpr int kPlayGetWaitSliceMs = 200;
 static constexpr int kPlayGetStallRecoveryMs = 1500;
 static constexpr uint32_t kPlayGetWindowBytes = 4096;
+// Non-stream sounds (prompts) have no in-band length, so their frames are
+// counted: PLAY_DATA_END is declared only after the last frame was written,
+// and only if no cloud TTS stream took over the session during the grace
+// window. The stall backstop bounds the wait when the count cannot be trusted
+// (frames dropped by ResetDecoder, or an uncounted PCM source).
+static constexpr int kSoundEndGraceMs = 1200;
+static constexpr int kSoundStallMs = 3000;
+// After PLAY_DATA_END the session normally ends on the chip's PLAY_STOP_EVT.
+// This bounds the wait for a lost event, and the restart paths wait for the
+// event before PLAY_START so a late stop cannot kill the fresh session.
+static constexpr int kPlayStopEvtFallbackMs = 1500;
+static constexpr int kPlayStopEvtQuiesceMs = 500;
 // Cap on unspent PLAY_GET credit. Four PLAY_DATA frames are 4 * 1936 = 7744 wire bytes, so
 // everything we may have in flight still fits in the CI130X 8212-byte UART stream buffer even
 // while its receive task is blocked pushing PCM into a full player buffer. Unbounded credit is
@@ -455,8 +467,14 @@ void Ci130xAudioCodec::HandlePacket(uint16_t cmd, const uint8_t* payload, size_t
             if (on_vad_end_) on_vad_end_();
             break;
         }
-        case CI_CMD_PLAY_STOP_EVT:
-            ESP_LOGI(TAG, "CI130X Play Stop Event");
+        case CI_CMD_PLAY_STOP_EVT: {
+            ESP_LOGI(TAG, "CI130X Play Stop Event (session=%lu, end_declared=%d, stream_active=%d)",
+                     (unsigned long)tts_session_,
+                     end_declared_.load() ? 1 : 0,
+                     output_stream_active_.load() ? 1 : 0);
+            // Whatever declaration this event answers, the chip has now fully
+            // settled its stop; restarts no longer need to wait for it.
+            stop_evt_expected_.store(false);
             if (cloud_playing_.exchange(false)) {
                 if (playback_timer_) esp_timer_stop(playback_timer_);
                 play_get_quota_.store(0);
@@ -467,10 +485,13 @@ void Ci130xAudioCodec::HandlePacket(uint16_t cmd, const uint8_t* payload, size_t
                     ESP_LOGW(TAG, "CI130X stopped while stream is active; preserving pending PCM");
                     if (play_get_sem_) xSemaphoreGive(play_get_sem_);
                 } else {
+                    ESP_LOGI(TAG, "Session ended by PLAY_STOP_EVT, turn complete (session=%lu)",
+                             (unsigned long)tts_session_);
                     ReportTtsPlaybackFinished();
                 }
             }
             break;
+        }
         case CI_CMD_PLAY_GET: {
             // Every PLAY_DATA_GET grants one fixed 4096-byte window; its payload is not
             // interpreted as a byte count. Grants accumulate up to kPlayGetMaxQuotaBytes so the
@@ -615,6 +636,9 @@ void Ci130xAudioCodec::StartPlaybackSession() {
     LatencyTracker::Instance().Mark(LatencyStage::kPlayStart);
     play_get_quota_.store(0);
     if (play_get_sem_) xQueueReset(play_get_sem_);
+    // Fresh session: no end declared for it yet, so the watchdog starts in the
+    // grace stage again.
+    end_declared_.store(false);
     ESP_LOGI(TAG, "Starting CI130X playback (session=%lu)",
              (unsigned long)tts_session_);
     SendPacket(CI_CMD_PLAY_START, nullptr, 0);
@@ -624,6 +648,52 @@ void Ci130xAudioCodec::StartPlaybackSession() {
     // the first PCM frame leave without waiting out the PLAY_GET round trip, which
     // sat on the critical path of every response's first word.
     play_get_quota_.store(kPlayGetWindowBytes);
+}
+
+void Ci130xAudioCodec::NotifySoundFrames(size_t count) {
+    if (count == 0) {
+        return;
+    }
+    const uint32_t total =
+        sound_frames_pending_.fetch_add(static_cast<uint32_t>(count)) +
+        static_cast<uint32_t>(count);
+    ESP_LOGI(TAG, "Sound frames queued: +%u (pending=%u, session=%lu)",
+             static_cast<unsigned>(count), static_cast<unsigned>(total),
+             (unsigned long)tts_session_);
+}
+
+void Ci130xAudioCodec::QuiescePendingPlaybackStop() {
+    if (!stop_evt_expected_.load()) {
+        return;
+    }
+    // A session we declared ended still owes its PLAY_STOP_EVT. Starting the
+    // next PLAY_START before the event lands lets the late stop kill the fresh
+    // session (observed as a playback wedge). Re-issue the stop so the chip
+    // answers even if the original end was swallowed, then wait bounded; after
+    // the timeout the expectation stays armed for the next restart attempt.
+    const int64_t start_us = esp_timer_get_time();
+    ESP_LOGI(TAG,
+             "Quiesce: PLAY_STOP_EVT still pending, holding PLAY_START "
+             "(session=%lu, wait<=%dms)",
+             (unsigned long)tts_session_, kPlayStopEvtQuiesceMs);
+    SendPacket(CI_CMD_PLAY_STOP, nullptr, 0);
+    for (int ms = 0;
+         ms < kPlayStopEvtQuiesceMs && stop_evt_expected_.load();
+         ms += 10) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    const int elapsed_ms =
+        static_cast<int>((esp_timer_get_time() - start_us) / 1000);
+    if (stop_evt_expected_.load()) {
+        ESP_LOGW(TAG,
+                 "Quiesce: PLAY_STOP_EVT did not arrive in %dms "
+                 "(session=%lu); restarting anyway",
+                 elapsed_ms, (unsigned long)tts_session_);
+    } else {
+        ESP_LOGI(TAG, "Quiesce: PLAY_STOP_EVT arrived after %dms (session=%lu)",
+                 elapsed_ms, (unsigned long)tts_session_);
+    }
 }
 
 int Ci130xAudioCodec::Write(const int16_t* data, int samples) {
@@ -641,6 +711,9 @@ int Ci130xAudioCodec::Write(const int16_t* data, int samples) {
     }
 
     if (!cloud_playing_.load()) {
+        // A session we declared ended may still owe its PLAY_STOP_EVT; wait it
+        // out before PLAY_START so the late stop cannot kill this session.
+        QuiescePendingPlaybackStop();
         LatencyTracker::Instance().Mark(LatencyStage::kFirstPcmWrite);
         StartPlaybackSession();
     }
@@ -665,10 +738,26 @@ int Ci130xAudioCodec::Write(const int16_t* data, int samples) {
                                reinterpret_cast<const uint8_t*>(data),
                                bytes);
 
-                    // Non-stream sounds do not have an explicit end callback,
-                    // so retain the original idle watchdog for that path.
                     if (playback_timer_ && !output_stream_active_.load()) {
-                        esp_timer_start_once(playback_timer_, 800 * 1000);
+                        // Non-stream sound frame: count it down. The frame that
+                        // takes the counter to zero is the sound's true last
+                        // frame; from there a short grace lets a cloud TTS
+                        // stream take over the session (NotifyOutputStreamStart
+                        // cancels the timer) before the end is declared.
+                        uint32_t pending = sound_frames_pending_.load();
+                        while (pending > 0 &&
+                               !sound_frames_pending_.compare_exchange_weak(
+                                   pending, pending - 1)) {
+                        }
+                        if (pending == 1) {
+                            ESP_LOGI(TAG,
+                                     "Sound last frame written, %dms TTS-takeover "
+                                     "grace armed (session=%lu)",
+                                     kSoundEndGraceMs, (unsigned long)tts_session_);
+                        }
+                        esp_timer_start_once(
+                            playback_timer_,
+                            (pending == 1 ? kSoundEndGraceMs : kSoundStallMs) * 1000);
                     }
                     return samples;
                 }
@@ -682,6 +771,9 @@ int Ci130xAudioCodec::Write(const int16_t* data, int samples) {
             if (!output_stream_active_.load()) {
                 return samples;
             }
+            // The stop event that killed the previous session may not be the
+            // last one in flight; wait out any pending one before PLAY_START.
+            QuiescePendingPlaybackStop();
             StartPlaybackSession();
             stall_start_us = esp_timer_get_time();
             continue;
@@ -713,10 +805,18 @@ int Ci130xAudioCodec::Write(const int16_t* data, int samples) {
         play_get_quota_.store(0);
         if (play_get_sem_) xQueueReset(play_get_sem_);
         SendPacket(CI_CMD_PLAY_STOP, nullptr, 0);
+        stop_evt_expected_.store(true);
         for (int wait_ms = 0;
-             wait_ms < 500 && cloud_playing_.load();
+             wait_ms < kPlayStopEvtQuiesceMs && cloud_playing_.load();
              wait_ms += 10) {
             vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (cloud_playing_.load()) {
+            ESP_LOGW(TAG, "Stall recovery: no PLAY_STOP_EVT in %dms (session=%lu)",
+                     kPlayStopEvtQuiesceMs, (unsigned long)tts_session_);
+        } else {
+            ESP_LOGI(TAG, "Stall recovery: PLAY_STOP_EVT confirmed (session=%lu)",
+                     (unsigned long)tts_session_);
         }
         cloud_playing_.store(false);
         StartPlaybackSession();
@@ -733,7 +833,19 @@ int Ci130xAudioCodec::OutputBufferedMs() const {
 void Ci130xAudioCodec::NotifyOutputStreamStart() {
     output_stream_active_.store(true);
     tts_stream_completion_pending_.store(true);
+    // The TTS stream takes over the session; whatever sound frames were still
+    // counted belong to it now and must not trigger a sound-end declaration.
+    const uint32_t leftover_frames =
+        sound_frames_pending_.exchange(0);
     if (playback_timer_) esp_timer_stop(playback_timer_);
+    if (cloud_playing_.load() || leftover_frames > 0) {
+        ESP_LOGI(TAG,
+                 "TTS stream takes over session=%lu (cloud_playing=%d, "
+                 "cancelled sound frames=%u, grace cancelled)",
+                 (unsigned long)tts_session_,
+                 cloud_playing_.load() ? 1 : 0,
+                 static_cast<unsigned>(leftover_frames));
+    }
 }
 
 void Ci130xAudioCodec::NotifyOutputStreamEnd() {
@@ -743,10 +855,12 @@ void Ci130xAudioCodec::NotifyOutputStreamEnd() {
         ESP_LOGI(TAG, "TTS stream drained, sending PLAY_DATA_END (session=%lu)",
                  (unsigned long)tts_session_);
         SendPacket(CI_CMD_PLAY_DATA_END, nullptr, 0);
+        end_declared_.store(true);
+        stop_evt_expected_.store(true);
         // Normally CI130X answers with PLAY_TTS_END. Keep a bounded fallback
         // so a lost end event cannot leave the application stuck in playback.
         if (playback_timer_) {
-            esp_timer_start_once(playback_timer_, 1500 * 1000);
+            esp_timer_start_once(playback_timer_, kPlayStopEvtFallbackMs * 1000);
         }
     } else if (tts_stream_completion_pending_.load()) {
         // The CI130X session is already gone (for example a mid-stream PLAY_TTS_END that was
@@ -768,9 +882,35 @@ void Ci130xAudioCodec::ReportTtsPlaybackFinished() {
 
 void Ci130xAudioCodec::OnPlaybackTimer(void* arg) {
     auto* self = static_cast<Ci130xAudioCodec*>(arg);
-    if (self->cloud_playing_.exchange(false)) {
-        ESP_LOGW(TAG, "Playback watchdog triggered, sending PLAY_DATA_END");
+    if (!self->cloud_playing_.load()) {
+        // Session already gone (PLAY_STOP_EVT or a forced teardown beat us).
+        return;
+    }
+    if (!self->end_declared_.load()) {
+        // Non-stream sound grace expired without a TTS takeover: declare the
+        // end now. The chip answers with PLAY_STOP_EVT once it has played the
+        // buffered PCM; that event, not this timer, completes the session.
+        self->end_declared_.store(true);
+        self->stop_evt_expected_.store(true);
+        ESP_LOGI(TAG,
+                 "Sound grace expired (no TTS takeover), sending PLAY_DATA_END, "
+                 "fallback %dms armed (session=%lu, pending_frames=%u)",
+                 kPlayStopEvtFallbackMs, (unsigned long)self->tts_session_,
+                 static_cast<unsigned>(self->sound_frames_pending_.load()));
         self->SendPacket(CI_CMD_PLAY_DATA_END, nullptr, 0);
+        // Bounded fallback in case the stop event is lost.
+        if (self->playback_timer_) {
+            esp_timer_start_once(self->playback_timer_,
+                                 kPlayStopEvtFallbackMs * 1000);
+        }
+        return;
+    }
+    // The end was declared but the chip never confirmed with PLAY_STOP_EVT.
+    if (self->cloud_playing_.exchange(false)) {
+        ESP_LOGW(TAG,
+                 "Playback watchdog: no PLAY_STOP_EVT %dms after PLAY_DATA_END "
+                 "(session=%lu); forcing turn end",
+                 kPlayStopEvtFallbackMs, (unsigned long)self->tts_session_);
         self->play_get_quota_.store(0);
         if (self->play_get_sem_) xQueueReset(self->play_get_sem_);
         self->ReportTtsPlaybackFinished();
@@ -887,6 +1027,8 @@ void Ci130xAudioCodec::EnableOutput(bool enable) {
         cloud_playing_.store(false);
         play_get_quota_.store(0);
         if (play_get_sem_) xQueueReset(play_get_sem_);
+        sound_frames_pending_.store(0);
+        stop_evt_expected_.store(true);
     }
 }
 
@@ -897,6 +1039,8 @@ void Ci130xAudioCodec::BlockNextTts() {
     // The caller ends this turn itself, so the discarded response must not also report a
     // playback completion once the blocked frames drain out of the pipeline.
     tts_stream_completion_pending_.store(false);
+    // Counted sound frames are dropped along with everything else.
+    sound_frames_pending_.store(0);
 
     // If audio is currently playing on the CI130X chip, immediately stop it
     if (cloud_playing_.load()) {
@@ -906,6 +1050,7 @@ void Ci130xAudioCodec::BlockNextTts() {
         cloud_playing_.store(false);
         play_get_quota_.store(0);
         if (play_get_sem_) xQueueReset(play_get_sem_);
+        stop_evt_expected_.store(true);
     }
     SendPacket(CI_CMD_SET_CLOUD_ANS_TIMEOUT_EXIT, nullptr, 0);
 }

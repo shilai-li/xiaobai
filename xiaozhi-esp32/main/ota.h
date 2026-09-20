@@ -88,6 +88,7 @@ private:
     esp_err_t FetchFirmwareMetadata();
     std::string GetActivationPayload();
     std::unique_ptr<Http> SetupHttp(const std::string& token = "");
+    bool SyncTimeFromHttpDate();
     esp_err_t GetMoinaiToken(std::string& token_out, int64_t& expires_at_ms_out);
 };
 

@@ -775,7 +775,7 @@ esp_err_t Ota::RefreshMoinaiToken() {
     const bool clock_valid = gmtime_r(&refresh_time.tv_sec, &utc_tm) != nullptr &&
                              utc_tm.tm_year + 1900 >= 2023 && utc_tm.tm_year + 1900 <= 2037;
     if (!clock_valid) {
-        if (!Board::GetInstance().SyncSystemTime() && !SyncTimeFromHttpDate()) {
+        if (!SyncTimeFromHttpDate()) {
             ESP_LOGE(TAG, "Unable to synchronize system time before Moinai token refresh");
             return ESP_ERR_TIMEOUT;
         }
@@ -821,7 +821,7 @@ esp_err_t Ota::ValidateCachedMoinaiToken() {
     const bool clock_valid = gmtime_r(&now.tv_sec, &utc_tm) != nullptr &&
                              utc_tm.tm_year + 1900 >= 2023 && utc_tm.tm_year + 1900 <= 2037;
     if (!clock_valid) {
-        if (!Board::GetInstance().SyncSystemTime() && !SyncTimeFromHttpDate()) {
+        if (!SyncTimeFromHttpDate()) {
             // Degrade to a warning instead of failing activation: with a
             // stale clock the expiry check below is merely optimistic (the
             // token looks far from expiry and is kept as-is), and the

@@ -1003,9 +1003,9 @@ void Application::CheckAssetsVersion() {
 }
 
 void Application::CheckNewVersion() {
-    const int MAX_RETRY = 10;
+    const int MAX_RETRY = 2;
     int retry_count = 0;
-    int retry_delay = 10; // Initial retry delay in seconds
+    int retry_delay = 2; // Initial retry delay in seconds
 #if CONFIG_BOARD_TYPE_ESP32C3_CI130X
     bool activation_prompt_active = false;
     bool activation_success_reported = false;

@@ -15,7 +15,7 @@ clean:
 	@echo "Environment cleaned successfully."
 
 .PHONY: build
-build:
+build: esp32c3
 	@echo "Preparing environment..."
 	. ~/esp/esp-idf/export.sh && echo "Building project..." && python scripts/release.py esp32c3-ci130x
 	@echo "Project built successfully."

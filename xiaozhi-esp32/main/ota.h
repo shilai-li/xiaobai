@@ -49,7 +49,7 @@ public:
     bool ShouldRefreshMoinaiToken() const;
     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
     static bool Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback);
-    void MarkCurrentVersionValid();
+    static void MarkCurrentVersionValid();
 
     const std::string& GetFirmwareVersion() const { return firmware_version_; }
     const std::string& GetCurrentVersion() const { return current_version_; }
@@ -85,6 +85,7 @@ private:
     std::function<void(int progress, size_t speed)> upgrade_callback_;
     std::vector<int> ParseVersion(const std::string& version);
     bool IsNewVersionAvailable(const std::string& currentVersion, const std::string& newVersion);
+    esp_err_t FetchFirmwareMetadata();
     std::string GetActivationPayload();
     std::unique_ptr<Http> SetupHttp(const std::string& token = "");
     bool SyncTimeFromHttpDate();

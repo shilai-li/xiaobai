@@ -3,14 +3,14 @@
 #include "settings.h"
 #include "assets/lang_config.h"
 #include "moinai_device_settings.h"
+#include "ota_feature_config.h"
+#include "ota_image_writer.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <cJSON.h>
 #include <esp_log.h>
-#include <esp_partition.h>
 #include <esp_ota_ops.h>
-#include <esp_app_format.h>
 #include <esp_efuse.h>
 #include <esp_efuse_table.h>
 #include <esp_heap_caps.h>
@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <ctime>
+#include <initializer_list>
 
 #define TAG "Ota"
 
@@ -550,10 +551,164 @@ esp_err_t Ota::CheckVersion() {
         ESP_LOGI(TAG, "Device activation request skipped (already activated)");
     }
 
-    // 4. Authentication completed (and activation, when enabled), so WebSocket
+    // 4. OTA discovery is optional. A failed update server must not prevent the
+    // device from starting its normal WebSocket service.
+#if CLOUD_OTA_ENABLED
+    esp_err_t firmware_err = FetchFirmwareMetadata();
+    if (firmware_err == kErrUnauthorized) {
+        ESP_LOGW(TAG, "Cloud OTA check rejected the token; refreshing and retrying once");
+        if (RefreshMoinaiToken() == ESP_OK) {
+            firmware_err = FetchFirmwareMetadata();
+        }
+    }
+    if (firmware_err != ESP_OK) {
+        ESP_LOGW(TAG, "Cloud OTA metadata check failed (%d); continuing startup",
+                 firmware_err);
+    }
+#else
+    has_new_version_ = false;
+    firmware_version_.clear();
+    firmware_url_.clear();
+    ESP_LOGI(TAG, "Cloud OTA is disabled at compile time");
+#endif
+
+    // 5. Authentication completed (and activation, when enabled), so WebSocket
     // configuration is ready for use.
     has_websocket_config_ = true;
     return ESP_OK;
+}
+
+esp_err_t Ota::FetchFirmwareMetadata() {
+#if !CLOUD_OTA_ENABLED
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    has_new_version_ = false;
+    firmware_version_.clear();
+    firmware_url_.clear();
+
+    if (!has_serial_number_ || moinai_token_.empty()) {
+        ESP_LOGW(TAG, "Skip cloud OTA check: device identity is unavailable");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    std::string base_url = GetCheckVersionUrl();
+    if (!base_url.empty() && base_url.back() == '/') {
+        base_url.pop_back();
+    }
+    const std::string metadata_url =
+        base_url + CLOUD_OTA_METADATA_PATH + serial_number_;
+    auto http = SetupHttp(moinai_token_);
+    http->SetHeader("Current-Version", current_version_);
+    http->SetHeader("Board-Type", BOARD_TYPE);
+    if (!http->Open("GET", metadata_url)) {
+        ESP_LOGW(TAG, "Failed to open cloud OTA metadata request");
+        return ESP_FAIL;
+    }
+
+    const int status = http->GetStatusCode();
+    // 204 No Content is complete after the response headers. ML307 does not
+    // emit a content URC for it, so ReadAll() would wait for the full timeout.
+    std::string response;
+    if (status != 204) {
+        response = http->ReadAll();
+    }
+    http->Close();
+    if (status == 204 || status == 404) {
+        ESP_LOGI(TAG, "No cloud firmware update is published");
+        return ESP_OK;
+    }
+    if (status != 200) {
+        ESP_LOGW(TAG, "Cloud OTA metadata request failed with status %d: %s",
+                 status, response.c_str());
+        return MapMoinaiHttpError(status, response);
+    }
+
+    cJSON* root = cJSON_Parse(response.c_str());
+    if (!cJSON_IsObject(root)) {
+        if (root != nullptr) {
+            cJSON_Delete(root);
+        }
+        ESP_LOGW(TAG, "Cloud OTA metadata is not a JSON object");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    cJSON* envelope = root;
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
+    if (cJSON_IsObject(data)) {
+        envelope = data;
+    }
+    cJSON* metadata = envelope;
+    cJSON* firmware = cJSON_GetObjectItemCaseSensitive(envelope, "firmware");
+    if (cJSON_IsObject(firmware)) {
+        metadata = firmware;
+    }
+
+    const auto find_item = [](cJSON* object,
+                              std::initializer_list<const char*> names) -> cJSON* {
+        for (const char* name : names) {
+            cJSON* item = cJSON_GetObjectItemCaseSensitive(object, name);
+            if (item != nullptr) {
+                return item;
+            }
+        }
+        return nullptr;
+    };
+    const auto read_string = [&find_item](
+                                 cJSON* object,
+                                 std::initializer_list<const char*> names) {
+        cJSON* item = find_item(object, names);
+        return cJSON_IsString(item) && item->valuestring != nullptr
+                   ? std::string(item->valuestring)
+                   : std::string();
+    };
+
+    cJSON* available = find_item(
+        envelope, {"updateAvailable", "update_available", "available"});
+    if (available == nullptr && envelope != root) {
+        available = find_item(
+            root, {"updateAvailable", "update_available", "available"});
+    }
+    if (available == nullptr && metadata != envelope) {
+        available = find_item(
+            metadata, {"updateAvailable", "update_available", "available"});
+    }
+    if (cJSON_IsBool(available) && cJSON_IsFalse(available)) {
+        cJSON_Delete(root);
+        ESP_LOGI(TAG, "Backend reports that firmware is current");
+        return ESP_OK;
+    }
+
+    firmware_version_ = read_string(
+        metadata, {"version", "firmwareVersion", "firmware_version"});
+    firmware_url_ = read_string(
+        metadata, {"url", "firmwareUrl", "firmware_url", "downloadUrl",
+                   "download_url"});
+
+    const bool backend_requires_update =
+        cJSON_IsBool(available) && cJSON_IsTrue(available);
+    const bool valid_url = firmware_url_.rfind("https://", 0) == 0 ||
+                           firmware_url_.rfind("http://", 0) == 0;
+    if (firmware_version_.empty() || !valid_url) {
+        ESP_LOGW(TAG, "Cloud OTA metadata lacks a valid version or download URL");
+        firmware_version_.clear();
+        firmware_url_.clear();
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    has_new_version_ = backend_requires_update ||
+        IsNewVersionAvailable(current_version_, firmware_version_);
+    if (!has_new_version_) {
+        firmware_version_.clear();
+        firmware_url_.clear();
+        ESP_LOGI(TAG, "Firmware is current");
+    } else {
+        ESP_LOGI(TAG, "Cloud firmware %s is available",
+                 firmware_version_.c_str());
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+#endif
 }
 
 // Fall back to the server's HTTP Date header when the modem clock (CCLK) is
@@ -625,7 +780,7 @@ esp_err_t Ota::RefreshMoinaiToken() {
     const bool clock_valid = gmtime_r(&refresh_time.tv_sec, &utc_tm) != nullptr &&
                              utc_tm.tm_year + 1900 >= 2023 && utc_tm.tm_year + 1900 <= 2037;
     if (!clock_valid) {
-        if (!Board::GetInstance().SyncSystemTime() && !SyncTimeFromHttpDate()) {
+        if (!SyncTimeFromHttpDate()) {
             ESP_LOGE(TAG, "Unable to synchronize system time before Moinai token refresh");
             return ESP_ERR_TIMEOUT;
         }
@@ -671,7 +826,7 @@ esp_err_t Ota::ValidateCachedMoinaiToken() {
     const bool clock_valid = gmtime_r(&now.tv_sec, &utc_tm) != nullptr &&
                              utc_tm.tm_year + 1900 >= 2023 && utc_tm.tm_year + 1900 <= 2037;
     if (!clock_valid) {
-        if (!Board::GetInstance().SyncSystemTime() && !SyncTimeFromHttpDate()) {
+        if (!SyncTimeFromHttpDate()) {
             // Degrade to a warning instead of failing activation: with a
             // stale clock the expiry check below is merely optimistic (the
             // token looks far from expiry and is kept as-is), and the
@@ -839,8 +994,12 @@ esp_err_t Ota::FetchDeviceSettings() {
         }
     }
 
-    cJSON* sleep_time = cJSON_GetObjectItemCaseSensitive(root, "sleepTime");
-    const char* sleep_key = "sleepTime";
+    cJSON* sleep_time = cJSON_GetObjectItemCaseSensitive(root, "standbyTime");
+    const char* sleep_key = "standbyTime";
+    if (sleep_time == nullptr) {
+        sleep_time = cJSON_GetObjectItemCaseSensitive(root, "sleepTime");
+        sleep_key = "sleepTime";
+    }
     if (sleep_time == nullptr) {
         sleep_time = cJSON_GetObjectItemCaseSensitive(root, "sleepTimeout");
         sleep_key = "sleepTimeout";
@@ -937,18 +1096,18 @@ void Ota::MarkCurrentVersionValid() {
 }
 
 bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback) {
+#if !CLOUD_OTA_ENABLED
+    (void)firmware_url;
+    (void)callback;
+    ESP_LOGW(TAG, "Cloud OTA download is disabled at compile time");
+    return false;
+#else
     ESP_LOGI(TAG, "Upgrading firmware from %s", firmware_url.c_str());
-    esp_ota_handle_t update_handle = 0;
-    auto update_partition = esp_ota_get_next_update_partition(NULL);
-    if (update_partition == NULL) {
-        ESP_LOGE(TAG, "Failed to get update partition");
-        return false;
-    }
-
-    ESP_LOGI(TAG, "Writing to partition %s at offset 0x%lx", update_partition->label, update_partition->address);
-    bool image_header_checked = false;
-    std::string image_header;
-
+    // 应用 rollback 机制下，esp_ota_begin() 要求运行镜像已被确认（VALID），
+    // 否则返回 ESP_ERR_OTA_ROLLBACK_INVALID_STATE。升级前必须先确认自身。
+    // 确认后再开始写入还能保证：若下载中途断电，运行分区仍可正常引导，
+    // 不会回滚到刚被擦除的旧分区（否则有变砖风险）。
+    MarkCurrentVersionValid();
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
     if (!http->Open("GET", firmware_url)) {
@@ -958,12 +1117,22 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
 
     if (http->GetStatusCode() != 200) {
         ESP_LOGE(TAG, "Failed to get firmware, status code: %d", http->GetStatusCode());
+        http->Close();
         return false;
     }
 
     size_t content_length = http->GetBodyLength();
     if (content_length == 0) {
         ESP_LOGE(TAG, "Failed to get content length");
+        http->Close();
+        return false;
+    }
+
+    OtaImageWriter writer(content_length);
+    esp_err_t err = writer.Begin();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to prepare cloud OTA: %s", esp_err_to_name(err));
+        http->Close();
         return false;
     }
 
@@ -971,25 +1140,37 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
     char* buffer = (char*)heap_caps_malloc(PAGE_SIZE, MALLOC_CAP_INTERNAL);
     if (buffer == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate buffer");
+        http->Close();
         return false;
     }
 
-    size_t buffer_offset = 0;  // Current data size in buffer
     size_t total_read = 0, recent_read = 0;
     auto last_calc_time = esp_timer_get_time();
-    while (true) {
-        int ret = http->Read(buffer + buffer_offset, PAGE_SIZE - buffer_offset);
-        if (ret < 0) {
-            ESP_LOGE(TAG, "Failed to read HTTP data: %s", esp_err_to_name(ret));
+    while (total_read < content_length) {
+        const size_t remaining = content_length - total_read;
+        const int ret = http->Read(buffer, std::min(PAGE_SIZE, remaining));
+        if (ret <= 0) {
+            ESP_LOGE(TAG, "Cloud OTA download ended after %u of %u bytes",
+                     static_cast<unsigned int>(total_read),
+                     static_cast<unsigned int>(content_length));
+            http->Close();
             heap_caps_free(buffer);
             return false;
         }
 
-        // Calculate speed and progress every second
+        err = writer.Write(buffer, static_cast<size_t>(ret));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to write cloud OTA image: %s",
+                     esp_err_to_name(err));
+            http->Close();
+            heap_caps_free(buffer);
+            return false;
+        }
+
         recent_read += ret;
         total_read += ret;
-        buffer_offset += ret;
-        if (esp_timer_get_time() - last_calc_time >= 1000000 || ret == 0) {
+        if (esp_timer_get_time() - last_calc_time >= 1000000 ||
+            total_read == content_length) {
             size_t progress = total_read * 100 / content_length;
             ESP_LOGI(TAG, "Progress: %u%% (%u/%u), Speed: %uB/s", progress, total_read, content_length, recent_read);
             if (callback) {
@@ -998,64 +1179,20 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
             last_calc_time = esp_timer_get_time();
             recent_read = 0;
         }
-
-        if (!image_header_checked) {
-            image_header.append(buffer, buffer_offset);
-            if (image_header.size() >= sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
-                esp_app_desc_t new_app_info;
-                memcpy(&new_app_info, image_header.data() + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
-
-                if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle)) {
-                    esp_ota_abort(update_handle);
-                    ESP_LOGE(TAG, "Failed to begin OTA");
-                    heap_caps_free(buffer);
-                    return false;
-                }
-
-                image_header_checked = true;
-                std::string().swap(image_header);
-            }
-        }
-
-        // Write to flash when buffer is full (4KB) or it's the last chunk
-        bool is_last_chunk = (ret == 0);
-        if (buffer_offset == PAGE_SIZE || (is_last_chunk && buffer_offset > 0)) {
-            auto err = esp_ota_write(update_handle, buffer, buffer_offset);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
-                esp_ota_abort(update_handle);
-                heap_caps_free(buffer);
-                return false;
-            }
-
-            buffer_offset = 0;
-        }
-
-        if (is_last_chunk) {
-            break;
-        }
     }
     http->Close();
     heap_caps_free(buffer);
 
-    esp_err_t err = esp_ota_end(update_handle);
+    err = writer.Finish();
     if (err != ESP_OK) {
-        if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
-            ESP_LOGE(TAG, "Image validation failed, image is corrupted");
-        } else {
-            ESP_LOGE(TAG, "Failed to end OTA: %s", esp_err_to_name(err));
-        }
-        return false;
-    }
-
-    err = esp_ota_set_boot_partition(update_partition);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set boot partition: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Cloud OTA image validation failed: %s",
+                 esp_err_to_name(err));
         return false;
     }
 
     ESP_LOGI(TAG, "Firmware upgrade successful");
     return true;
+#endif
 }
 
 bool Ota::StartUpgrade(std::function<void(int progress, size_t speed)> callback) {
@@ -1065,29 +1202,55 @@ bool Ota::StartUpgrade(std::function<void(int progress, size_t speed)> callback)
 
 std::vector<int> Ota::ParseVersion(const std::string& version) {
     std::vector<int> versionNumbers;
-    std::stringstream ss(version);
-    std::string segment;
-    
-    while (std::getline(ss, segment, '.')) {
-        versionNumbers.push_back(std::stoi(segment));
+    size_t start = 0;
+    if (!version.empty() && (version[0] == 'v' || version[0] == 'V')) {
+        start = 1;
     }
-    
+    const size_t suffix = version.find_first_of("-+", start);
+    std::stringstream ss(version.substr(start, suffix - start));
+    std::string segment;
+
+    while (std::getline(ss, segment, '.')) {
+        if (segment.empty() ||
+            !std::all_of(segment.begin(), segment.end(), [](unsigned char ch) {
+                return ch >= '0' && ch <= '9';
+            })) {
+            return {};
+        }
+        errno = 0;
+        char* end = nullptr;
+        const long value = std::strtol(segment.c_str(), &end, 10);
+        if (errno != 0 || end == segment.c_str() || *end != '\0' ||
+            value < 0 || value > INT32_MAX) {
+            return {};
+        }
+        versionNumbers.push_back(static_cast<int>(value));
+    }
+
     return versionNumbers;
 }
 
 bool Ota::IsNewVersionAvailable(const std::string& currentVersion, const std::string& newVersion) {
     std::vector<int> current = ParseVersion(currentVersion);
     std::vector<int> newer = ParseVersion(newVersion);
-    
-    for (size_t i = 0; i < std::min(current.size(), newer.size()); ++i) {
-        if (newer[i] > current[i]) {
+    if (current.empty() || newer.empty()) {
+        ESP_LOGW(TAG, "Cannot compare firmware versions '%s' and '%s'",
+                 currentVersion.c_str(), newVersion.c_str());
+        return false;
+    }
+
+    const size_t width = std::max(current.size(), newer.size());
+    for (size_t i = 0; i < width; ++i) {
+        const int current_part = i < current.size() ? current[i] : 0;
+        const int new_part = i < newer.size() ? newer[i] : 0;
+        if (new_part > current_part) {
             return true;
-        } else if (newer[i] < current[i]) {
+        } else if (new_part < current_part) {
             return false;
         }
     }
-    
-    return newer.size() > current.size();
+
+    return false;
 }
 
 esp_err_t Ota::Activate() {

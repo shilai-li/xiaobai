@@ -2020,8 +2020,9 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
         protocol_->CloseAudioChannel();
     }
     ESP_LOGI(TAG, "Starting firmware upgrade from URL: %s", upgrade_url.c_str());
-
-    Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "download", Lang::Sounds::OGG_UPGRADE);
+    auto* ci130x_codec = static_cast<Ci130xAudioCodec*>(
+                Board::GetInstance().GetAudioCodec());
+    ci130x_codec->NotifyStatus(CI_STATUS_UPGRADING);
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     SetDeviceState(kDeviceStateUpgrading);

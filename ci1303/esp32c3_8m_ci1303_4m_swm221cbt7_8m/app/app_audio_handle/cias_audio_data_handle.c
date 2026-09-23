@@ -326,6 +326,7 @@ int32_t aiot_wifi_msg_callback(const uint8_t *msg_buf)
                 connecting_prompt_played_early = true;
             }
             else if (status_id == ESP32_STATUS_CONNECTING ||
+                     status_id == ESP32_STATUS_UPGRADING ||
                      status_id == ESP32_STATUS_REGISTER_FAILED ||
                      status_id == ESP32_STATUS_ACTIVATE_FAILED ||
                      status_id == ESP32_STATUS_CONNECT_SUCCESS ||

@@ -606,7 +606,12 @@ esp_err_t Ota::FetchFirmwareMetadata() {
     }
 
     const int status = http->GetStatusCode();
-    const std::string response = http->ReadAll();
+    // 204 No Content is complete after the response headers. ML307 does not
+    // emit a content URC for it, so ReadAll() would wait for the full timeout.
+    std::string response;
+    if (status != 204) {
+        response = http->ReadAll();
+    }
     http->Close();
     if (status == 204 || status == 404) {
         ESP_LOGI(TAG, "No cloud firmware update is published");

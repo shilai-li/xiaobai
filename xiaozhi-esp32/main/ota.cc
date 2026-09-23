@@ -1098,6 +1098,11 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
     return false;
 #else
     ESP_LOGI(TAG, "Upgrading firmware from %s", firmware_url.c_str());
+    // 应用 rollback 机制下，esp_ota_begin() 要求运行镜像已被确认（VALID），
+    // 否则返回 ESP_ERR_OTA_ROLLBACK_INVALID_STATE。升级前必须先确认自身。
+    // 确认后再开始写入还能保证：若下载中途断电，运行分区仍可正常引导，
+    // 不会回滚到刚被擦除的旧分区（否则有变砖风险）。
+    MarkCurrentVersionValid();
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
     if (!http->Open("GET", firmware_url)) {

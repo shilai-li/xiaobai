@@ -1047,15 +1047,18 @@ void Application::CheckNewVersion() {
         retry_count = 0;
         retry_delay = 10; // Reset retry delay
 
+        // 版本检查成功即确认运行镜像有效：
+        // 1. 修复升级尝试先于 MarkCurrentVersionValid 执行导致的必现失败
+        //    （esp_ota_begin 返回 ESP_ERR_OTA_ROLLBACK_INVALID_STATE）
+        // 2. 将未确认窗口从 ~11s 缩短到 ~2s（版本检查成功点）
+        ota_->MarkCurrentVersionValid();
+
         if (ota_->HasNewVersion()) {
             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
                 return; // This line will never be reached after reboot
             }
             // If upgrade failed, continue to normal operation
         }
-
-        // No new version, mark the current version as valid
-        ota_->MarkCurrentVersionValid();
         if (!ota_->HasActivationCode() && !ota_->HasActivationChallenge()) {
             // Exit the loop if done checking new version
             break;

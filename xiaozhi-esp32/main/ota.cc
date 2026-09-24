@@ -512,7 +512,7 @@ esp_err_t Ota::CheckVersion() {
 
     // 2. Store token for activation / websocket to read.
     settings.SetString("token", moinai_token_);
-    settings.SetString("url", "wss://robotic-test.moinai.com/api/v1/bot");
+    settings.SetString("url", "wss://robotic-chat.moinai.com/api/v1/bot");
 
     // 3. Call activation when explicitly enabled, or when the backend has told
     // us that its activation record was removed. The latter must work even on
@@ -803,7 +803,7 @@ esp_err_t Ota::RefreshMoinaiToken() {
     Settings settings("websocket", true);
     settings.SetString("token", moinai_token_);
     settings.SetString("token_expiry", std::to_string(moinai_token_expires_at_ms_));
-    settings.SetString("url", "wss://robotic-test.moinai.com/api/v1/bot");
+    settings.SetString("url", "wss://robotic-chat.moinai.com/api/v1/bot");
     const std::string expires_at_text = std::to_string(moinai_token_expires_at_ms_);
     const std::string masked_token = MaskMoinaiToken(moinai_token_);
     ESP_LOGI(TAG, "Stored refreshed Moinai token: %s (length=%u); expires_at_ms=%s",

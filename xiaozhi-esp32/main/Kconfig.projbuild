@@ -2,19 +2,19 @@ menu "Xiaozhi Assistant"
 
 config OTA_URL
     string "Moinai Backend Base URL"
-    default "https://robotic-test.moinai.com"
+    default "https://robotic-chat.moinai.com"
     help
         The application will access this URL to check for new firmwares and server address.
 
 config MOINAI_ACCESS_KEY_ID
     string "Moinai Access Key ID"
-    default "g/x2+6t9zKnY50uN8XwKYsTQh5aqCZ8a"
+    default "g/y2+6t9zKnY50uN8XwKYsTQh5aqCZ8a"
     help
         Access Key ID for Moinai API authentication.
 
 config MOINAI_ACCESS_KEY_SECRET
     string "Moinai Access Key Secret"
-    default "yOx7TpXgYSfw6BMKM+9XZKhY4SMcP0L4WVbgTx6BCD0="
+    default "yOy7TpXgYSfw6BMKM+9XZKhY4SMcP0L4WVbgTx6BCD0="
     help
         Access Key Secret for Moinai API authentication.
 

@@ -157,8 +157,8 @@ void Ml307Board::RunLbsAtTest() {
              at_uart->GetResponse().c_str());
 
     if (ping_supported) {
-        const char* ping_host = "robotic-test.moinai.com";
-        const char* ping_command = "AT+MPING=\"robotic-test.moinai.com\",10,1,16,1";
+        const char* ping_host = "robotic-chat.moinai.com";
+        const char* ping_command = "AT+MPING=\"robotic-chat.moinai.com\",10,1,16,1";
         bool ping_started = at_uart->SendCommand(ping_command, 3000);
         ESP_LOGI(TAG, "4G ping start: host=%s, result=%s\n%s", ping_host,
                  ping_started ? "STARTED" : "FAILED", at_uart->GetResponse().c_str());
@@ -267,7 +267,7 @@ void Ml307Board::NetworkTask() {
 
         // Extract host from CONFIG_OTA_URL
         std::string ota_url = CONFIG_OTA_URL;
-        std::string host = "robotic-test.moinai.com"; // default fallback
+        std::string host = "robotic-chat.moinai.com"; // default fallback
         size_t proto_end = ota_url.find("://");
         if (proto_end != std::string::npos) {
             size_t host_start = proto_end + 3;

@@ -22,7 +22,7 @@ static constexpr int MODEM_DETECT_MAX_RETRIES = 30;
 // Maximum retry count for network registration
 static constexpr int NETWORK_REG_MAX_RETRIES = 6;
 // +MIPCALL can announce an IP shortly before ML307's socket service is ready.
-static constexpr int PDP_SOCKET_SETTLE_MS = 300;
+static constexpr int PDP_SOCKET_SETTLE_MS = 1000;
 
 // 3GPP TS 27.007 <AcT> values returned by +CREG/+CGREG/+CEREG. Keep this
 // decoder in diagnostics so logs identify the actual radio technology instead

@@ -388,6 +388,11 @@ esp_err_t Ota::GetMoinaiToken(std::string& token_out, int64_t& expires_at_ms_out
         }
 
         int status = http->GetStatusCode();
+        if (status <= 0) {
+            http->Close();
+            ESP_LOGW(TAG, "Moinai Auth request failed: no response headers (status=%d)", status);
+            continue;
+        }
         std::string server_date = http->GetResponseHeader("Date");
         std::string response = http->ReadAll();
         http->Close();
@@ -606,6 +611,11 @@ esp_err_t Ota::FetchFirmwareMetadata() {
     }
 
     const int status = http->GetStatusCode();
+    if (status <= 0) {
+        http->Close();
+        ESP_LOGW(TAG, "Cloud OTA metadata request failed: no response headers (status=%d)", status);
+        return ESP_FAIL;
+    }
     // 204 No Content is complete after the response headers. ML307 does not
     // emit a content URC for it, so ReadAll() would wait for the full timeout.
     std::string response;
@@ -917,6 +927,11 @@ esp_err_t Ota::FetchDeviceSettings() {
     }
 
     const int status = http->GetStatusCode();
+    if (status <= 0) {
+        http->Close();
+        ESP_LOGW(TAG, "Failed to fetch settings: no response headers (status=%d)", status);
+        return ESP_FAIL;
+    }
     std::string response = http->ReadAll();
     http->Close();
     if (status != 200) {
@@ -1276,6 +1291,11 @@ esp_err_t Ota::Activate() {
     }
 
     int status = http->GetStatusCode();
+    if (status <= 0) {
+        http->Close();
+        ESP_LOGE(TAG, "Activation failed: no response headers (status=%d)", status);
+        return ESP_FAIL;
+    }
     std::string response = http->ReadAll();
     http->Close();
 
@@ -1325,6 +1345,11 @@ esp_err_t Ota::FetchTopics(std::vector<DeviceTopic>& topics) {
     }
 
     int status = http->GetStatusCode();
+    if (status <= 0) {
+        http->Close();
+        ESP_LOGW(TAG, "Topic polling failed: no response headers (status=%d)", status);
+        return ESP_FAIL;
+    }
     std::string response = http->ReadAll();
     http->Close();
     if (status != 200) {
@@ -1396,6 +1421,11 @@ esp_err_t Ota::ReportCurrentLocation() {
         return ESP_FAIL;
     }
     int status = http->GetStatusCode();
+    if (status <= 0) {
+        http->Close();
+        ESP_LOGW(TAG, "Location report failed: no response headers (status=%d)", status);
+        return ESP_FAIL;
+    }
     // 204 No Content is complete after the response headers. ML307 does not
     // emit a content URC for it, so ReadAll() would wait for the full timeout.
     std::string response;

@@ -21,9 +21,4 @@
 #define CLOUD_OTA_METADATA_PATH "/api/v1/embeded/device/firmware/"
 #endif
 
-// Set to 1 to enable testing the OTA upgrading voice and screen 15s after network connects
-#ifndef TEST_OTA_UPGRADE_AFTER_CONNECT
-#define TEST_OTA_UPGRADE_AFTER_CONNECT 0
-#endif
-
 #endif  // OTA_FEATURE_CONFIG_H

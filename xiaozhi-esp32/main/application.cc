@@ -661,20 +661,12 @@ void Application::ActivationTask() {
     // consumed by a diagnostic-only read.
     StartTopicPolling();
 
-#if defined(TEST_OTA_UPGRADE_AFTER_CONNECT) && TEST_OTA_UPGRADE_AFTER_CONNECT
-    // Test task: verify CI1303 OTA voice prompt and SWM221 screen display 15 seconds after connecting
-    xTaskCreate([](void* arg) {
-        ESP_LOGI(TAG, "[OTA_TEST] Waiting 15 seconds after connection to test upgrading voice and screen...");
-        vTaskDelay(pdMS_TO_TICKS(15000));
-        ESP_LOGI(TAG, "[OTA_TEST] Executing OTA upgrading status test (ID: %u)...", CI_STATUS_UPGRADING);
+
 #if CONFIG_BOARD_TYPE_ESP32C3_CI130X
         auto* codec = static_cast<Ci130xAudioCodec*>(Board::GetInstance().GetAudioCodec());
         if (codec != nullptr) {
             codec->NotifyStatus(CI_STATUS_UPGRADING);
         }
-#endif
-        vTaskDelete(nullptr);
-    }, "ota_test_task", 2048, nullptr, 3, nullptr);
 #endif
 }
 
@@ -2041,8 +2033,9 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     auto* ci130x_codec = static_cast<Ci130xAudioCodec*>(board.GetAudioCodec());
     if (ci130x_codec != nullptr) {
         ci130x_codec->NotifyStatus(CI_STATUS_UPGRADING);
+    } else {
+        Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "download", Lang::Sounds::OGG_UPGRADE);
     }
-    Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "download", "");
 #else
     Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "download", Lang::Sounds::OGG_UPGRADE);
 #endif

@@ -58,6 +58,7 @@ enum Ci130xStatus : uint16_t {
     CI_STATUS_CONNECTING = 2226,
     CI_STATUS_CONNECT_SUCCESS = 2227,
     CI_STATUS_CONNECT_FAILED = 2228,
+    CI_STATUS_UPGRADING = 2229,
 };
 
 // Registration and final connection statuses are reported for display but

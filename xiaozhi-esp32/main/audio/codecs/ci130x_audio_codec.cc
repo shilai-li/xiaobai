@@ -5,6 +5,7 @@
 #include "settings.h"
 #include "moinai_device_settings.h"
 #include <esp_log.h>
+#include <esp_random.h>
 #include <esp_timer.h>
 #include <string.h>
 #include <algorithm>
@@ -1095,19 +1096,9 @@ void Ci130xAudioCodec::StartPowerOnPrompt() {
         return;
     }
 
-    // Pick the voice here rather than in SendPowerOnPrompt(): this runs on the
-    // main loop, while the send can be driven from the RX task, whose stack is
-    // too small for NVS access.
-    {
-        Settings settings("ci130x", true);
-        int32_t last_index = settings.GetInt("pwr_prompt", kPowerOnPromptCount - 1);
-        if (last_index < 0 || last_index >= kPowerOnPromptCount) {
-            last_index = kPowerOnPromptCount - 1;
-        }
-        int32_t next_index = (last_index + 1) % kPowerOnPromptCount;
-        settings.SetInt("pwr_prompt", next_index);
-        power_on_prompt_voice_id_ = kPowerOnPromptFirstId + static_cast<uint16_t>(next_index);
-    }
+    // Pick a random prompt ID (5000-5004) without persisting to NVS.
+    uint32_t random_index = esp_random() % kPowerOnPromptCount;
+    power_on_prompt_voice_id_ = kPowerOnPromptFirstId + static_cast<uint16_t>(random_index);
 
     if (local_play_fallback_timer_) {
         esp_timer_stop(local_play_fallback_timer_);
